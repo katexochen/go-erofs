@@ -123,10 +123,5 @@ func TestFindPclusterForOffset(t *testing.T) {
 	}
 }
 
-func TestFindPclusterCompactRejected(t *testing.T) {
-	d := &Decoder{Layout: disk.LayoutCompressedCompact, NLclusters: 1, Size: 4096, LclusterBits: 12, BlkSizeBits: 12}
-	_, err := d.Entry(0)
-	if err == nil {
-		t.Fatal("compact layout should return error")
-	}
-}
+// Compact-layout decoding is exercised end-to-end through the integration
+// tests in compressed_test.go (default mkfs.erofs -z lz4 emits compact).

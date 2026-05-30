@@ -849,17 +849,14 @@ func (img *image) buildZDecoder(fi *inode) (*zerofs.Decoder, error) {
 	lcsize := int64(1) << lclusterBits
 	nlc := int((fi.size + lcsize - 1) / lcsize)
 
-	if fi.inodeLayout != disk.LayoutCompressedFull {
-		return nil, fmt.Errorf("nid %d: compact lcluster layout not yet supported: %w",
-			fi.nid, ErrNotImplemented)
-	}
-
 	// The lcluster index follows the 8-byte map header. mkfs.erofs's legacy
-	// (pre-COMPR_CFGS) full layout inserts an additional 8 bytes of padding
-	// between the header and the index; modern images do not. We detect
-	// legacy mode by the absence of FeatureIncompatComprCfgs.
+	// full-layout encoding (used by -Elegacy-compress, recognisable here by
+	// the absence of FeatureIncompatComprCfgs combined with the full layout)
+	// inserts an additional 8 bytes of padding between the header and the
+	// index. Compact-layout and modern full-layout images do not.
 	indexBase := mapHeaderAddr + disk.SizeZMapHeader
-	if img.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs == 0 {
+	if fi.inodeLayout == disk.LayoutCompressedFull &&
+		img.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs == 0 {
 		indexBase += 8 // Z_EROFS_LEGACY_HEADER_PADDING
 	}
 

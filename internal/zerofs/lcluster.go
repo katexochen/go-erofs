@@ -56,7 +56,7 @@ func (d *Decoder) Entry(idx int) (LclusterEntry, error) {
 	case disk.LayoutCompressedFull:
 		return d.decodeFull(idx)
 	case disk.LayoutCompressedCompact:
-		return LclusterEntry{}, fmt.Errorf("compact lcluster layout not supported: %w", ErrNotImplemented)
+		return d.decodeCompact(idx)
 	default:
 		return LclusterEntry{}, fmt.Errorf("unknown compressed layout %d", d.Layout)
 	}

@@ -2,17 +2,12 @@ package erofs_test
 
 import (
 	"bytes"
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	erofs "github.com/erofs/go-erofs"
 	"github.com/erofs/go-erofs/internal/erofstest"
 )
 
@@ -176,51 +171,112 @@ func TestCompressedCrossValidate(t *testing.T) {
 	}
 }
 
-// TestCompressedDeferred verifies that compressed-image features outside
-// this PR's scope (compact lcluster layout) return ErrNotImplemented when
-// the image is read, rather than silently producing wrong data.
-func TestCompressedDeferred(t *testing.T) {
+// TestCompressedLZ4Compact runs the standard TestCases through the default
+// mkfs.erofs LZ4 converter (compact lcluster layout, no -Elegacy-compress).
+// This is the layout modern mkfs.erofs and tools like mkosi emit by default.
+func TestCompressedLZ4Compact(t *testing.T) {
 	erofstest.RequireMkfsLZ4(t)
 
-	t.Run("CompactLayout", func(t *testing.T) {
-		// Default mkfs.erofs `-z lz4` produces compact lcluster layout, which
-		// the reader does not yet handle.
-		tc := erofstest.TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
-		wt := erofstest.TarAll(
-			tc.File("/big.bin", bytes.Repeat([]byte{0xAA}, 64*1024), 0644),
-		)
-		tarStream := erofstest.TarFromWriterTo(wt)
-		defer func() { _ = tarStream.Close() }()
-		path := filepath.Join(t.TempDir(), "compact.erofs")
-		if err := erofstest.ConvertTarErofs(context.Background(), tarStream, path, "", []string{"-z", "lz4"}); err != nil {
-			t.Fatal(err)
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = f.Close() }()
+	for _, tc := range []struct {
+		name  string
+		test  erofstest.TestCase
+		flags []string
+	}{
+		{"Basic", erofstest.Basic, nil},
+		{"FileSizes", erofstest.FileSizes, nil},
+		{"LongXattrs", erofstest.LongXattrs, erofstest.XattrPrefixFlags()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.test.Run(t, mkfsCompactLZ4(tc.flags...))
+		})
+	}
 
-		fsys, err := erofs.Open(f)
-		if err != nil {
-			// Some mkfs.erofs versions may produce full layout even without
-			// -Elegacy-compress for short files; if Open already errored,
-			// that's also acceptable as long as it's ErrNotImplemented.
-			if !errors.Is(err, erofs.ErrNotImplemented) {
-				t.Fatalf("Open: want ErrNotImplemented, got %v", err)
-			}
-			return
-		}
-		// Reading the compressed file should fail with ErrNotImplemented
-		// at loadCompressedBlock time.
-		_, err = fs.ReadFile(fsys, "big.bin")
-		if err == nil {
-			t.Fatal("expected an error reading compact-layout file, got nil")
-		}
-		if !errors.Is(err, erofs.ErrNotImplemented) {
-			t.Errorf("compact-layout read: want ErrNotImplemented, got %v", err)
-		}
+	t.Run("LargeFile", func(t *testing.T) {
+		erofstest.LargeFile.Run(t, mkfsCompactLZ4())
 	})
+}
+
+// TestCompressedCompactCrossValidate builds the same tar tree as plain and
+// as default-compact-LZ4 and confirms every regular file's bytes match.
+func TestCompressedCompactCrossValidate(t *testing.T) {
+	erofstest.RequireMkfsLZ4(t)
+
+	tc := erofstest.TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	entries := []erofstest.WriterToTar{
+		tc.Dir("/d", 0755),
+		tc.File("/d/empty.bin", []byte{}, 0644),
+		tc.File("/d/small.bin", []byte("hello world\n"), 0644),
+		tc.File("/d/just-block.bin", bytes.Repeat([]byte{0xAB}, 4096), 0644),
+		tc.File("/d/just-over.bin", bytes.Repeat([]byte{0xCD}, 4097), 0644),
+		tc.File("/d/sequence.bin", generateSeq(64*1024), 0644),
+		tc.File("/d/zeros.bin", bytes.Repeat([]byte{0}, 64*1024), 0644),
+		tc.File("/d/repeating.bin", bytes.Repeat([]byte("the quick brown fox jumps\n"), 1024), 0644),
+		// Mix compressible and incompressible regions so mkfs.erofs emits
+		// several PLAIN pclusters interleaved with HEAD1 pclusters.
+		tc.File("/d/mixed.bin", mixedContent(256*1024), 0644),
+	}
+
+	plainFsys := erofstest.MkfsErofs()(t, erofstest.TarAll(entries...))
+	lz4Fsys := mkfsCompactLZ4()(t, erofstest.TarAll(entries...))
+
+	err := fs.WalkDir(plainFsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		want, err := fs.ReadFile(plainFsys, p)
+		if err != nil {
+			t.Errorf("plain %s: %v", p, err)
+			return nil
+		}
+		got, err := fs.ReadFile(lz4Fsys, p)
+		if err != nil {
+			t.Errorf("compact-lz4 %s: %v", p, err)
+			return nil
+		}
+		if !bytes.Equal(want, got) {
+			t.Errorf("%s: compact-lz4 vs plain bytes differ (len %d vs %d)", p, len(got), len(want))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mkfsCompactLZ4(extraOpts ...string) erofstest.Converter {
+	return erofstest.MkfsErofs(append([]string{"-z", "lz4"}, extraOpts...)...)
+}
+
+// mixedContent returns a buffer that alternates between very compressible
+// runs of one byte and a deterministic incompressible pseudo-random region.
+func mixedContent(size int) []byte {
+	b := make([]byte, size)
+	chunk := 16 * 1024
+	seed := uint32(0xCAFEBABE)
+	for off := 0; off < size; off += chunk {
+		end := off + chunk
+		if end > size {
+			end = size
+		}
+		if (off/chunk)%2 == 0 {
+			for i := off; i < end; i++ {
+				b[i] = byte((off / chunk) + 1)
+			}
+		} else {
+			x := seed + uint32(off)
+			for i := off; i < end; i++ {
+				x ^= x << 13
+				x ^= x >> 17
+				x ^= x << 5
+				b[i] = byte(x)
+			}
+		}
+	}
+	return b
 }
 
 // readAndCompare opens name, reads it fully, and compares against want.
