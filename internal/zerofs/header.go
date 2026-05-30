@@ -47,16 +47,19 @@ func ParseHeader(buf []byte) (disk.ZMapHeader, error) {
 	if h.Advise&disk.ZAdviseInterlacedPcluster != 0 {
 		return h, fmt.Errorf("interlaced pcluster not supported: %w", ErrNotImplemented)
 	}
-	if h.Advise&disk.ZAdviseBigPcluster2 != 0 {
-		return h, fmt.Errorf("big pcluster (head2) not supported: %w", ErrNotImplemented)
-	}
+	// BIG_PCLUSTER_2 is the big-pcluster flag for the head2 algorithm slot.
+	// We don't implement head2 at all, so this flag is irrelevant; ignore it.
 	if h.AlgorithmType>>4 != 0 {
 		return h, fmt.Errorf("second compression algorithm (head2=%d) not supported: %w",
 			h.AlgorithmType>>4, ErrNotImplemented)
 	}
-	if h.AlgorithmType&0xF != 0 {
+	head1 := h.AlgorithmType & 0xF
+	switch head1 {
+	case disk.AlgoIDLZ4, disk.AlgoIDZstd:
+		// supported
+	default:
 		return h, fmt.Errorf("compression algorithm %d not supported: %w",
-			h.AlgorithmType&0xF, ErrNotImplemented)
+			head1, ErrNotImplemented)
 	}
 	return h, nil
 }

@@ -29,6 +29,14 @@ const (
 	SizeZMapHeader      = 8
 	SizeLclusterIndex   = 8
 	SizeLZ4Cfgs         = 14
+	SizeZstdCfgs        = 6
+
+	// AlgoID* identify a single compression algorithm in the map header's
+	// AlgorithmType field (low/high nibble for head1/head2 respectively).
+	AlgoIDLZ4     = 0
+	AlgoIDLZMA    = 1
+	AlgoIDDeflate = 2
+	AlgoIDZstd    = 3
 
 	LayoutFlatPlain         = 0
 	LayoutCompressedFull    = 1
@@ -187,12 +195,13 @@ type InodeChunkIndex struct {
 
 // ZMapHeader is the 8-byte z_erofs_map_header that sits after xattrs in a
 // compressed inode and describes the cluster index layout that follows.
+// Field order matches the kernel struct (h_algorithmtype before h_clusterbits).
 type ZMapHeader struct {
 	Reserved1     uint16
 	IdataSize     uint16
 	Advise        uint16
-	ClusterBits   uint8 // log2(lcluster size) - SuperBlock.BlkSizeBits (low 3 bits)
 	AlgorithmType uint8 // low 4 bits: head1 algo; high 4 bits: head2 algo
+	ClusterBits   uint8 // log2(lcluster size) - SuperBlock.BlkSizeBits (low 3 bits)
 }
 
 // LclusterIndex is an 8-byte z_erofs_lcluster_index entry in the
@@ -214,6 +223,14 @@ type LZ4Cfgs struct {
 	MaxDistance     uint16
 	MaxPclusterBlks uint16
 	Reserved        [10]uint8
+}
+
+// ZstdCfgs is the Zstd entry of the COMPR_CFGS records.  WindowLog stores
+// (actual_window_log - 10) per the EROFS spec.
+type ZstdCfgs struct {
+	Format    uint8
+	WindowLog uint8
+	Reserved  [4]uint8
 }
 
 // DeviceSlot represents the on-disk device table entry (erofs_deviceslot).

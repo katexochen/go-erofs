@@ -251,6 +251,80 @@ func mkfsCompactLZ4(extraOpts ...string) erofstest.Converter {
 	return erofstest.MkfsErofs(append([]string{"-z", "lz4"}, extraOpts...)...)
 }
 
+// TestCompressedZstd runs the standard TestCases through `mkfs.erofs -z zstd`,
+// which produces compact lcluster layout with big_pcluster_1 enabled (the
+// configuration emitted by mkosi and most modern container tooling).
+func TestCompressedZstd(t *testing.T) {
+	erofstest.RequireMkfsZstd(t)
+
+	for _, tc := range []struct {
+		name  string
+		test  erofstest.TestCase
+		flags []string
+	}{
+		{"Basic", erofstest.Basic, nil},
+		{"FileSizes", erofstest.FileSizes, nil},
+		{"LongXattrs", erofstest.LongXattrs, erofstest.XattrPrefixFlags()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.test.Run(t, erofstest.MkfsErofsZstd(tc.flags...))
+		})
+	}
+
+	t.Run("LargeFile", func(t *testing.T) {
+		erofstest.LargeFile.Run(t, erofstest.MkfsErofsZstd())
+	})
+}
+
+// TestCompressedZstdCrossValidate builds the same tar tree as plain and as
+// Zstd-compressed and confirms every regular file's bytes match.
+func TestCompressedZstdCrossValidate(t *testing.T) {
+	erofstest.RequireMkfsZstd(t)
+
+	tc := erofstest.TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	entries := []erofstest.WriterToTar{
+		tc.Dir("/d", 0755),
+		tc.File("/d/empty.bin", []byte{}, 0644),
+		tc.File("/d/small.bin", []byte("hello world\n"), 0644),
+		tc.File("/d/just-block.bin", bytes.Repeat([]byte{0xAB}, 4096), 0644),
+		tc.File("/d/just-over.bin", bytes.Repeat([]byte{0xCD}, 4097), 0644),
+		tc.File("/d/sequence.bin", generateSeq(64*1024), 0644),
+		tc.File("/d/zeros.bin", bytes.Repeat([]byte{0}, 64*1024), 0644),
+		tc.File("/d/repeating.bin", bytes.Repeat([]byte("the quick brown fox jumps\n"), 1024), 0644),
+		tc.File("/d/mixed.bin", mixedContent(256*1024), 0644),
+	}
+
+	plainFsys := erofstest.MkfsErofs()(t, erofstest.TarAll(entries...))
+	zstdFsys := erofstest.MkfsErofsZstd()(t, erofstest.TarAll(entries...))
+
+	err := fs.WalkDir(plainFsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		want, err := fs.ReadFile(plainFsys, p)
+		if err != nil {
+			t.Errorf("plain %s: %v", p, err)
+			return nil
+		}
+		got, err := fs.ReadFile(zstdFsys, p)
+		if err != nil {
+			t.Errorf("zstd %s: %v", p, err)
+			return nil
+		}
+		if !bytes.Equal(want, got) {
+			t.Errorf("%s: zstd vs plain bytes differ (len %d vs %d)", p, len(got), len(want))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // mixedContent returns a buffer that alternates between very compressible
 // runs of one byte and a deterministic incompressible pseudo-random region.
 func mixedContent(size int) []byte {

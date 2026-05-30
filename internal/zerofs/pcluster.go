@@ -89,14 +89,17 @@ func (d *Decoder) FindPclusterForOffset(pos int64) (Pcluster, error) {
 	case disk.ZLclusterTypePlain:
 		pc.NPhysBlks = uint32((logLen + blkSize - 1) / blkSize)
 	case disk.ZLclusterTypeHead1:
-		if d.Header.Advise&disk.ZAdviseBigPcluster1 == 0 {
+		switch {
+		case d.Header.Advise&disk.ZAdviseBigPcluster1 == 0:
 			pc.NPhysBlks = 1
-		} else {
-			if cblkcntFromTail == 0 {
-				return Pcluster{}, fmt.Errorf("big pcluster head=%d missing CBlkCnt marker: %w",
-					headLcn, ErrCorrupt)
-			}
+		case cblkcntFromTail != 0:
 			pc.NPhysBlks = uint32(cblkcntFromTail)
+		default:
+			// big_pcluster_1 advertised but no CBLKCNT marker found before
+			// the next pcluster head — that means this pcluster fit in one
+			// physical block. Matches the kernel's z_erofs_get_extent_-
+			// compressedlen fallback.
+			pc.NPhysBlks = 1
 		}
 	}
 	if pc.NPhysBlks == 0 {

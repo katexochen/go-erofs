@@ -40,10 +40,6 @@ func checkMkfsLZ4() {
 		mkfsLZ4Reason = "mkfs.erofs not on PATH"
 		return
 	}
-	// Attempt a tiny LZ4 conversion. mkfs.erofs reads tar input from stdin
-	// with --tar=f. We pipe an empty tar (a 1024-byte zero tail) and check
-	// only the early reject path: if LZ4 is unsupported, mkfs.erofs prints
-	// "Unsupported compression algorithm" or similar before consuming input.
 	cmd := exec.Command("mkfs.erofs", "--help")
 	out, _ := cmd.CombinedOutput()
 	help := strings.ToLower(string(out))
@@ -52,4 +48,40 @@ func checkMkfsLZ4() {
 		return
 	}
 	mkfsLZ4Avail = true
+}
+
+// MkfsErofsZstd returns a Converter that runs mkfs.erofs with `-z zstd`
+// (compact lcluster layout, big_pcluster_1 enabled — the modern default for
+// the Zstd algorithm).
+func MkfsErofsZstd(extraOpts ...string) Converter {
+	return MkfsErofs(append([]string{"-z", "zstd"}, extraOpts...)...)
+}
+
+// RequireMkfsZstd skips t when mkfs.erofs lacks Zstd support.
+func RequireMkfsZstd(t testing.TB) {
+	t.Helper()
+	mkfsZstdOnce.Do(checkMkfsZstd)
+	if !mkfsZstdAvail {
+		t.Skipf("mkfs.erofs zstd unavailable: %s", mkfsZstdReason)
+	}
+}
+
+var (
+	mkfsZstdOnce   sync.Once
+	mkfsZstdAvail  bool
+	mkfsZstdReason string
+)
+
+func checkMkfsZstd() {
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		mkfsZstdReason = "mkfs.erofs not on PATH"
+		return
+	}
+	cmd := exec.Command("mkfs.erofs", "--help")
+	out, _ := cmd.CombinedOutput()
+	if !strings.Contains(strings.ToLower(string(out)), "zstd") {
+		mkfsZstdReason = "mkfs.erofs --help does not advertise zstd"
+		return
+	}
+	mkfsZstdAvail = true
 }

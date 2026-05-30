@@ -195,9 +195,10 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 	// in pre-COMPR_CFGS erofs).
 	i.lz4Cfg.MaxPclusterBlks = 1
 	if i.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs != 0 {
-		if i.sb.ComprAlgs&^disk.ComprAlgLZ4 != 0 {
-			return nil, fmt.Errorf("unsupported compression algorithm 0x%x (only LZ4 supported): %w",
-				i.sb.ComprAlgs, ErrNotImplemented)
+		const supported = uint16(disk.ComprAlgLZ4 | disk.ComprAlgZstd)
+		if i.sb.ComprAlgs&^supported != 0 {
+			return nil, fmt.Errorf("unsupported compression algorithm 0x%x (only LZ4+Zstd supported): %w",
+				i.sb.ComprAlgs&^supported, ErrNotImplemented)
 		}
 		if err := i.parseComprCfgs(); err != nil {
 			return nil, err
@@ -287,7 +288,8 @@ func (img *image) parseComprCfgs() error {
 			return fmt.Errorf("read compr_cfgs payload at %d (size=%d): %w", pos, size, err)
 		}
 		pos += int64(size)
-		if mask == disk.ComprAlgLZ4 {
+		switch mask {
+		case disk.ComprAlgLZ4:
 			if size < disk.SizeLZ4Cfgs {
 				return fmt.Errorf("lz4 compr_cfgs payload too short: %d < %d: %w",
 					size, disk.SizeLZ4Cfgs, ErrInvalidSuperblock)
@@ -301,6 +303,19 @@ func (img *image) parseComprCfgs() error {
 			if img.lz4Cfg.MaxPclusterBlks > maxLZ4PclusterBlks {
 				return fmt.Errorf("max_pclusterblks %d exceeds limit %d: %w",
 					img.lz4Cfg.MaxPclusterBlks, maxLZ4PclusterBlks, ErrInvalid)
+			}
+		case disk.ComprAlgZstd:
+			// We don't actually need ZstdCfgs at decode time
+			// (klauspost/compress/zstd handles arbitrary windows up to its
+			// own configured maximum), but parse the record so the COMPR_CFGS
+			// stream advances correctly for any subsequent algorithm entries.
+			if size < disk.SizeZstdCfgs {
+				return fmt.Errorf("zstd compr_cfgs payload too short: %d < %d: %w",
+					size, disk.SizeZstdCfgs, ErrInvalidSuperblock)
+			}
+			var zcfg disk.ZstdCfgs
+			if _, err := binary.Decode(payload[:disk.SizeZstdCfgs], binary.LittleEndian, &zcfg); err != nil {
+				return fmt.Errorf("decode zstd compr_cfgs: %w", err)
 			}
 		}
 	}
@@ -964,7 +979,7 @@ func (img *image) getOrDecompressPcluster(nid uint64, dec *zerofs.Decoder, pc ze
 		return data, nil
 	}
 	buf := make([]byte, pc.LogLen)
-	if _, err := zerofs.Decompress(img.meta, img.sb.BlkSizeBits, pc, buf); err != nil {
+	if _, err := dec.Decompress(pc, buf); err != nil {
 		return nil, err
 	}
 	img.pcCache.put(key, buf)

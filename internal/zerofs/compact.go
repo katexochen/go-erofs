@@ -21,10 +21,7 @@ func (d *Decoder) decodeCompact(lcn int) (LclusterEntry, error) {
 		return LclusterEntry{}, fmt.Errorf("compact format requires lclusterbits <= 14, got %d: %w",
 			d.LclusterBits, ErrNotImplemented)
 	}
-	if d.Header.Advise&disk.ZAdviseBigPcluster1 != 0 {
-		return LclusterEntry{}, fmt.Errorf("big_pcluster_1 in compact layout not supported: %w",
-			ErrNotImplemented)
-	}
+	bigPcluster := d.Header.Advise&disk.ZAdviseBigPcluster1 != 0
 
 	ebase := d.IndexBase
 	totalidx := d.NLclusters
@@ -87,8 +84,13 @@ func (d *Decoder) decodeCompact(lcn int) (LclusterEntry, error) {
 
 	if typ == disk.ZLclusterTypeNonhead {
 		if lo&disk.ZLclusterD0CBlkCnt != 0 {
-			return LclusterEntry{}, fmt.Errorf("CBLKCNT marker without big_pcluster (compact): %w",
-				ErrCorrupt)
+			if !bigPcluster {
+				return LclusterEntry{}, fmt.Errorf("CBLKCNT marker without big_pcluster (compact): %w",
+					ErrCorrupt)
+			}
+			e.CBlkCnt = uint16(lo &^ disk.ZLclusterD0CBlkCnt)
+			e.DeltaPrev = 1
+			return e, nil
 		}
 		if idxInGroup+1 != vcnt {
 			// Normal NONHEAD: lo is delta[0] (backward distance to head).
@@ -127,24 +129,50 @@ func (d *Decoder) decodeCompact(lcn int) (LclusterEntry, error) {
 
 	// Walk back through the group's preceding entries, accumulating the
 	// number of head-equivalent transitions. NONHEAD entries are skipped by
-	// their backward delta (and a +1 for the skip step itself in the count).
-	nblk := 1
+	// their backward delta. For big_pcluster_1 the writer encodes physical
+	// block counts inline (CBLKCNT marker on NONHEAD entries) and the
+	// walkback algorithm tracks those compressed block additions instead of
+	// per-head increments.
+	var nblk int
 	j := idxInGroup - 1
-	for j >= 0 {
-		prevLo, prevType := decodeCompactedBits(uint(lobits), groupBuf, encodebits*j)
-		if prevType == disk.ZLclusterTypeNonhead {
-			// Note: only non-last-in-group NONHEAD entries are reachable here
-			// (j < idxInGroup-1 ≤ vcnt-2), so prevLo really is delta[0].
-			j -= int(prevLo)
-			if j >= 0 {
-				nblk++
+	if !bigPcluster {
+		nblk = 1
+		for j >= 0 {
+			prevLo, prevType := decodeCompactedBits(uint(lobits), groupBuf, encodebits*j)
+			if prevType == disk.ZLclusterTypeNonhead {
+				// Only non-last-in-group NONHEAD entries are reachable here,
+				// so prevLo really is delta[0].
+				j -= int(prevLo)
+				if j >= 0 {
+					nblk++
+				}
+				j--
+				continue
 			}
+			nblk++
 			j--
-			continue
 		}
-		// HEAD/PLAIN entry: another pcluster transition.
-		nblk++
-		j--
+	} else {
+		nblk = 0
+		for j >= 0 {
+			prevLo, prevType := decodeCompactedBits(uint(lobits), groupBuf, encodebits*j)
+			if prevType == disk.ZLclusterTypeNonhead {
+				if prevLo&disk.ZLclusterD0CBlkCnt != 0 {
+					nblk += int(prevLo &^ disk.ZLclusterD0CBlkCnt)
+					j -= 2
+					continue
+				}
+				if prevLo <= 1 {
+					return LclusterEntry{}, fmt.Errorf("big_pcluster compact NONHEAD with delta=%d: %w",
+						prevLo, ErrCorrupt)
+				}
+				j -= int(prevLo) - 2
+				j--
+				continue
+			}
+			nblk++
+			j--
+		}
 	}
 	trailing := binary.LittleEndian.Uint32(groupBuf[groupSize-4:])
 	e.BlkAddr = trailing + uint32(nblk)

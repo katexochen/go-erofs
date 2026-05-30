@@ -22,17 +22,14 @@ func TestParseHeaderRejectsUnsupported(t *testing.T) {
 		{"InterlacedPcluster", func(b *[disk.SizeZMapHeader]byte) {
 			b[4] = disk.ZAdviseInterlacedPcluster
 		}},
-		{"BigPcluster2", func(b *[disk.SizeZMapHeader]byte) {
-			b[4] = disk.ZAdviseBigPcluster2
-		}},
 		{"IdataSize", func(b *[disk.SizeZMapHeader]byte) {
 			b[2] = 0x10 // IdataSize low byte
 		}},
 		{"AlgoLZMA", func(b *[disk.SizeZMapHeader]byte) {
-			b[7] = disk.ComprAlgLZMA // algorithm type byte = 0x2 (LZMA in head1)
+			b[6] = disk.AlgoIDLZMA // head1 algorithm = LZMA (deferred)
 		}},
 		{"AlgoHead2", func(b *[disk.SizeZMapHeader]byte) {
-			b[7] = 0x10 // head2 algorithm = 1, head1 = 0
+			b[6] = 0x10 // head2 algorithm = 1, head1 = 0
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
