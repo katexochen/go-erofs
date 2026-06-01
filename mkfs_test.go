@@ -1262,6 +1262,72 @@ func TestMetadataOnlyNoFileData(t *testing.T) {
 	})
 }
 
+// TestChunkIndexAlignment verifies that chunk index entries land on an
+// 8-byte boundary even when the preceding xattr area is 4-aligned but not
+// 8-aligned. The reader (loadBlock / openDirect) aligns up to 8 when
+// decoding 8-byte chunk index entries; the writer must therefore insert
+// matching pad bytes.
+//
+// Regression: previously, a chunk-based inode whose (icsize + xattr) area
+// was not a multiple of 8 caused the reader to skip 4 bytes into the chunk
+// array and decode garbage. A hole chunk (StartBlkLo == 0xFFFFFFFF) would
+// be misread as a real block reference with blk_lo=0x0000FFFF.
+//
+// fs.ReadFile would mask the bug — the chunk-based read path returns the
+// zero-initialised buffer when the misaligned blk_lo points past the end
+// of the image (the resulting EOF gets swallowed inside ReadFile). So
+// dump the inode through erofs.Dump and check that the chunk lines
+// indicate holes.
+func TestChunkIndexAlignment(t *testing.T) {
+	// MetadataOnly + Setxattr lands a chunk-based inode whose xsize is
+	// 12 (header) + 8 (one user.a / "" entry padded to 4) = 20 bytes,
+	// which is 4-aligned but not 8-aligned.
+	src := fstest.MapFS{
+		"f": &fstest.MapFile{Data: bytes.Repeat([]byte("x"), 8192), Mode: 0o644},
+	}
+
+	var meta testBuffer
+	w := erofs.Create(&meta)
+	if err := w.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Setxattr("f", "user.a", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var dump bytes.Buffer
+	if err := erofs.Dump(bytes.NewReader(meta.Bytes()), &dump); err != nil {
+		t.Fatal(err)
+	}
+
+	// The dump should contain the chunk listing for /f. Both chunks are
+	// holes when correctly aligned; non-hole entries indicate the
+	// misalignment regression.
+	out := dump.String()
+	const fHeader = "[inode] path=/f"
+	idx := bytes.Index(dump.Bytes(), []byte(fHeader))
+	if idx < 0 {
+		t.Fatalf("dump missing %q section:\n%s", fHeader, out)
+	}
+	section := out[idx:]
+	if next := bytes.Index([]byte(section), []byte("\n[inode]")); next >= 0 {
+		section = section[:next]
+	}
+	if !bytes.Contains([]byte(section), []byte("xsize=20")) {
+		t.Fatalf("test setup: xsize should be 20 (4-aligned, not 8) to exercise the regression\n%s", section)
+	}
+	// Two chunks of 4096 bytes each cover the 8192-byte file. Both should
+	// be holes (writer emits null sentinels in MetadataOnly mode against a
+	// non-erofs source).
+	holes := bytes.Count([]byte(section), []byte("hole"))
+	if holes != 2 {
+		t.Fatalf("expected 2 hole chunks for /f, got %d:\n%s", holes, section)
+	}
+}
+
 // chunkedFS is a test fs.FS that provides entries with pre-existing chunk
 // mappings and data readers, simulating an ext4-like source.
 type chunkedFS struct {

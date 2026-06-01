@@ -468,6 +468,16 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 	blocksPerChunk := cs / w.blockSize
 	nchunks := (int(e.size) + cs - 1) / cs
 
+	// Chunk index entries are 8 bytes and the reader aligns up to 8 when
+	// decoding them; emit zero padding here when the inode header + xattr
+	// area does not land on an 8-byte boundary. The pad length is included
+	// in trailingSize by calcTrailingSize.
+	if pad := chunkIndexPad(e); pad > 0 {
+		if _, err := buf.Write(w.zeroBuf[:pad]); err != nil {
+			return err
+		}
+	}
+
 	// Null chunk index (no mapping): StartBlkHi=0xFFFF, DeviceID=0, StartBlkLo=NullAddr.
 	var nullIdx [disk.SizeChunkIndex]byte
 	binary.LittleEndian.PutUint16(nullIdx[0:2], 0xFFFF)

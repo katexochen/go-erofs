@@ -135,6 +135,26 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	w.rootNid = root.nid
 }
 
+// chunkIndexPad returns the number of zero-padding bytes that must precede an
+// inode's chunk index area to align it to 8 bytes. The reader (loadBlock and
+// openDirect) aligns up to 8 when decoding 8-byte chunk index entries, so an
+// unaligned write would cause it to read past the start of the array.
+//
+// currentOff is always 32-aligned (each inode is padded to 32 bytes), and the
+// inode core size is 32 or 64 (both 8-aligned), so the only contributor that
+// can land on a 4-aligned-but-not-8-aligned offset is the xattr area.
+func chunkIndexPad(e *erofsEntry) int {
+	inodeSize := disk.SizeInodeExtended
+	if e.compact {
+		inodeSize = disk.SizeInodeCompact
+	}
+	off := inodeSize + e.xattrSize
+	if off%8 != 0 {
+		return 8 - (off % 8)
+	}
+	return 0
+}
+
 // calcTrailingSize returns the number of bytes following the 64-byte inode.
 func (w *erofsWriter) calcTrailingSize(e *erofsEntry) int {
 	switch e.mode & disk.StatTypeMask {
@@ -145,7 +165,7 @@ func (w *erofsWriter) calcTrailingSize(e *erofsEntry) int {
 			}
 			cs := w.entryChunkSize(e)
 			nchunks := (int(e.size) + cs - 1) / cs
-			return nchunks * disk.SizeChunkIndex
+			return chunkIndexPad(e) + nchunks*disk.SizeChunkIndex
 		}
 		if e.layout == disk.LayoutFlatInline {
 			return int(e.size)
