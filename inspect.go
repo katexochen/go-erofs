@@ -408,8 +408,10 @@ func dumpCompressed(img *image, w io.Writer, ino *inode) error {
 		fmt.Fprintf(w, "  zmap: build_decoder_error: %v\n", err)
 		return nil
 	}
-	if err := dumpLclusters(w, dec); err != nil {
-		fmt.Fprintf(w, "  zmap: lcluster_error: %v\n", err)
+	if ino.fragmentInode {
+		// No lcluster index to walk; the file's data lives in PackedNid.
+		// fragmentOff and PackedNid have already been surfaced by
+		// dumpZMapHeader and dumpSuperblock respectively.
 		return nil
 	}
 	if err := dumpPclusters(w, dec); err != nil {

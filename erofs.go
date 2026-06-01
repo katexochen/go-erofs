@@ -790,6 +790,9 @@ func (img *image) loadCompressedBlock(fi *inode, pos int64) (*block, error) {
 	if pos < 0 || pos >= fi.size {
 		return nil, fmt.Errorf("compressed read out of range: pos=%d size=%d: %w", pos, fi.size, io.EOF)
 	}
+	if fi.fragmentInode {
+		return img.loadFragmentBlock(fi, pos)
+	}
 
 	pc, err := dec.FindPclusterForOffset(pos)
 	if err != nil {
@@ -831,12 +834,65 @@ func (img *image) loadCompressedBlock(fi *inode, pos int64) (*block, error) {
 	return b, nil
 }
 
+// loadFragmentBlock returns the logical block containing file offset pos for
+// a fragment inode: the file has no lcluster index of its own — its entire
+// data is stored in the packed inode at byte offset fragmentOff. The block
+// is filled by reading [fragmentOff+blockStart, fragmentOff+blockEnd) from
+// the packed inode, where blockEnd is clipped to the file's logical size.
+//
+// The packed inode is opened as a regular file so its own layout (flat,
+// compressed, ...) is handled by the normal read path.
+func (img *image) loadFragmentBlock(fi *inode, pos int64) (*block, error) {
+	pf := &file{img: img, nid: img.sb.PackedNid}
+	pinfo, err := pf.readInfo()
+	if err != nil {
+		return nil, fmt.Errorf("nid %d: read packed inode: %w", fi.nid, err)
+	}
+	defer func() {
+		if pinfo.cached != nil {
+			img.putBlock(pinfo.cached)
+			pinfo.cached = nil
+		}
+	}()
+
+	blkSize := int64(1) << img.sb.BlkSizeBits
+	blockStart := pos &^ (blkSize - 1)
+	blockEnd := blockStart + blkSize
+	if blockEnd > fi.size {
+		blockEnd = fi.size
+	}
+
+	fragStart := int64(fi.fragmentOff) + pos
+	readLen := int(blockEnd - pos)
+	if fragStart+int64(readLen) > pinfo.size {
+		return nil, fmt.Errorf("nid %d: fragment read [%d,%d) exceeds packed inode size %d: %w",
+			fi.nid, fragStart, fragStart+int64(readLen), pinfo.size, ErrInvalid)
+	}
+
+	b := img.getBlock()
+	posInBlock := int(pos - blockStart)
+	pf.offset = fragStart
+	if _, err := io.ReadFull(pf, b.buf[posInBlock:posInBlock+readLen]); err != nil {
+		img.putBlock(b)
+		return nil, fmt.Errorf("nid %d: fragment read at packed offset %d: %w",
+			fi.nid, fragStart, err)
+	}
+	b.offset = int32(posInBlock)
+	b.end = int32(posInBlock + readLen)
+	return b, nil
+}
+
 // zDecoder returns the inode's compressed-data decoder, building it on first
 // use. Errors during initialisation are cached so we don't retry the same
-// invalid header repeatedly.
+// invalid header repeatedly. Returns (nil, nil) for fragment inodes (whole
+// file in packed inode) — the caller must check fi.fragmentInode after
+// invocation to decide which read path to take.
 func (img *image) zDecoder(fi *inode) (*zerofs.Decoder, error) {
 	if fi.zdec != nil {
 		return fi.zdec, nil
+	}
+	if fi.fragmentInode {
+		return nil, nil
 	}
 	if fi.zdecErr != nil {
 		return nil, fi.zdecErr
@@ -845,6 +901,9 @@ func (img *image) zDecoder(fi *inode) (*zerofs.Decoder, error) {
 	if err != nil {
 		fi.zdecErr = err
 		return nil, err
+	}
+	if fi.fragmentInode {
+		return nil, nil
 	}
 	fi.zdec = dec
 	return dec, nil
@@ -863,7 +922,19 @@ func (img *image) buildZDecoder(fi *inode) (*zerofs.Decoder, error) {
 		return nil, err
 	}
 
-	lclusterBits := img.sb.BlkSizeBits + (header.ClusterBits & 7)
+	// Fragment-inode: the file has no lcluster index of its own. Record the
+	// offset into the packed inode and return a nil decoder — loadCompressedBlock
+	// checks fi.fragmentInode and routes reads to the packed inode instead.
+	if header.ClusterBits&disk.ZClusterBitsFragmentInode != 0 {
+		if img.sb.PackedNid == 0 {
+			return nil, fmt.Errorf("nid %d: fragment-inode but superblock has no packed_nid", fi.nid)
+		}
+		fi.fragmentInode = true
+		fi.fragmentOff = uint32(header.Reserved1) | uint32(header.IdataSize)<<16
+		return nil, nil
+	}
+
+	lclusterBits := img.sb.BlkSizeBits + (header.ClusterBits & disk.ZClusterBitsLclusterMask)
 	if lclusterBits < img.sb.BlkSizeBits {
 		return nil, fmt.Errorf("nid %d: invalid lclusterbits %d (blkSizeBits=%d)",
 			fi.nid, lclusterBits, img.sb.BlkSizeBits)
@@ -1757,9 +1828,17 @@ type inode struct {
 	cached      *block
 
 	// zdec is the lazily-initialised compressed-data decoder. Only set for
-	// inodes whose inodeLayout is LayoutCompressedFull or LayoutCompressedCompact.
+	// inodes whose inodeLayout is LayoutCompressedFull or LayoutCompressedCompact,
+	// and not set when fragmentInode is true (no lcluster index to decode).
 	zdec    *zerofs.Decoder
 	zdecErr error
+
+	// fragmentInode is true when the inode's z_erofs map header has
+	// ZClusterBitsFragmentInode set: the file's entire data lives in the
+	// packed inode (SuperBlock.PackedNid) at byte offset fragmentOff. Set
+	// alongside zdec by zSetup.
+	fragmentInode bool
+	fragmentOff   uint32
 }
 
 func (ino *inode) flatDataOffset() int64 {

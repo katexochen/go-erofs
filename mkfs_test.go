@@ -1328,6 +1328,136 @@ func TestChunkIndexAlignment(t *testing.T) {
 	}
 }
 
+// TestFragmentInodeRead verifies that a compressed inode with the
+// FRAGMENT_INODE bit set in its z_erofs_map_header reads its data from
+// the packed inode at h_fragmentoff. The writer does not yet emit
+// fragment inodes, so we build a regular two-file image and patch a few
+// bytes to convert one file into a fragment inode that points into the
+// other. The read path should transparently fetch the bytes through the
+// packed inode.
+func TestFragmentInodeRead(t *testing.T) {
+	const (
+		packedContent = "BBBBBBBBBBBBBBBB" // 16 bytes; what's stored in the packed inode
+		fragSize      = 4                  // bytes the fragment inode logically holds
+		fragOffset    = 5                  // offset within packed inode where the fragment starts
+	)
+
+	// 1. Build a normal image with two files. We will repurpose them.
+	src := fstest.MapFS{
+		"packed.bin": &fstest.MapFile{Data: []byte(packedContent), Mode: 0o644},
+		"frag.bin":   &fstest.MapFile{Data: []byte("xxxx"), Mode: 0o644},
+	}
+	var meta testBuffer
+	w := erofs.Create(&meta)
+	if err := w.CopyFrom(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := meta.Bytes()
+
+	// 2. Decode the superblock to locate the metadata area.
+	var sb disk.SuperBlock
+	if err := binary.Read(bytes.NewReader(raw[disk.SuperBlockOffset:]), binary.LittleEndian, &sb); err != nil {
+		t.Fatal("decode superblock:", err)
+	}
+	metaStart := int64(sb.MetaBlkAddr) << sb.BlkSizeBits
+
+	// 3. Find each file's NID via fs.Stat.
+	img, err := erofs.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statNid := func(name string) uint64 {
+		fi, err := fs.Stat(img, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := fi.Sys().(*erofs.Stat)
+		return uint64(st.Ino)
+	}
+	packedNid := statNid("packed.bin")
+	fragNid := statNid("frag.bin")
+
+	// 4. Patch the superblock to mark frag.bin's referent. The fragments
+	// feature bit and PackedNid are what the reader checks when handling
+	// a fragment inode.
+	const sbFeatIncompat = disk.SuperBlockOffset + 60 // offset of FeatureIncompat
+	const sbPackedNid = disk.SuperBlockOffset + 96    // offset of PackedNid
+	binary.LittleEndian.PutUint32(raw[sbFeatIncompat:],
+		sb.FeatureIncompat|disk.FeatureIncompatFragments)
+	binary.LittleEndian.PutUint64(raw[sbPackedNid:], packedNid)
+
+	// 5. Patch frag.bin:
+	//    a) Switch its layout from flat-inline to compressed-full.
+	//    b) Set its file size to fragSize (the file shrinks logically).
+	//    c) Overwrite the inline-data trailing bytes with a z_erofs map
+	//       header whose cluster_bits has the FRAGMENT_INODE bit set and
+	//       whose union (reserved1+idata_size) encodes h_fragmentoff.
+	fragInodeAddr := metaStart + int64(fragNid)*disk.SizeInodeCompact
+	// Format field: bit 0 = extended, bits 1-3 = layout. Preserve extended bit.
+	format := binary.LittleEndian.Uint16(raw[fragInodeAddr:])
+	extended := format & 1
+	newFormat := (uint16(disk.LayoutCompressedFull) << 1) | extended
+	binary.LittleEndian.PutUint16(raw[fragInodeAddr:], newFormat)
+
+	// Patch the size field. The original src file was 4 bytes; we keep that.
+	// (For an extended inode, Size is at offset 8 as uint64; for compact at
+	//  offset 8 as uint32.)
+	if extended != 0 {
+		binary.LittleEndian.PutUint64(raw[fragInodeAddr+8:], uint64(fragSize))
+	} else {
+		binary.LittleEndian.PutUint32(raw[fragInodeAddr+8:], uint32(fragSize))
+	}
+
+	// The map header sits at alignUp8(inodeAddr + icsize + xsize). Our
+	// frag.bin has no xattrs, so the header is at inodeAddr + icsize.
+	icsize := int64(disk.SizeInodeCompact)
+	if extended != 0 {
+		icsize = disk.SizeInodeExtended
+	}
+	mapHdrAddr := fragInodeAddr + icsize
+	// 8-aligned by construction since icsize is 32 or 64.
+	// Build the header bytes: union = h_fragmentoff, cluster_bits bit 7 set.
+	hdr := make([]byte, disk.SizeZMapHeader)
+	binary.LittleEndian.PutUint16(hdr[0:2], uint16(fragOffset&0xFFFF))
+	binary.LittleEndian.PutUint16(hdr[2:4], uint16(fragOffset>>16))
+	// advise=0, algorithm_type=0, cluster_bits = FRAGMENT_INODE
+	hdr[7] = disk.ZClusterBitsFragmentInode
+	copy(raw[mapHdrAddr:], hdr)
+
+	// 6. Re-open the patched image and read frag.bin. Expect to get
+	// packedContent[fragOffset : fragOffset+fragSize].
+	patched, err := erofs.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal("open patched image:", err)
+	}
+	got, err := fs.ReadFile(patched, "frag.bin")
+	if err != nil {
+		t.Fatalf("ReadFile patched frag.bin: %v", err)
+	}
+	want := []byte(packedContent[fragOffset : fragOffset+fragSize])
+	if !bytes.Equal(got, want) {
+		t.Fatalf("frag.bin content: got %q, want %q", got, want)
+	}
+
+	// Also verify the dump recognises the fragment inode (regression check
+	// on the dump improvements landed alongside this support).
+	var dump bytes.Buffer
+	if err := erofs.Dump(bytes.NewReader(raw), &dump); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"h_fragmentoff: 0x00000005 (5) [whole file in packed inode",
+		"cluster_bits_raw: 0x80 [FRAGMENT_INODE]",
+	} {
+		if !bytes.Contains(dump.Bytes(), []byte(want)) {
+			t.Errorf("dump missing %q\n--- dump ---\n%s", want, dump.String())
+		}
+	}
+}
+
 // chunkedFS is a test fs.FS that provides entries with pre-existing chunk
 // mappings and data readers, simulating an ext4-like source.
 type chunkedFS struct {
