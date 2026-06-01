@@ -233,6 +233,11 @@ func dumpInodes(img *image, w io.Writer) error {
 		if err := dumpInodeCore(img, w, dumpPath(p), ino); err != nil {
 			return err
 		}
+		if ino.rawMode&disk.StatTypeMask == disk.StatTypeDir {
+			if err := dumpDirents(img, w, ino); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -307,6 +312,76 @@ func inodeDataHint(ino *inode) string {
 		return fmt.Sprintf(" (chunk_format_bits=%d%s)", fmtBits, flagStr)
 	}
 	return ""
+}
+
+// dumpDirents emits the on-disk dirent layout of a directory inode, one block
+// at a time in physical order. Entries are printed in storage order (including
+// "." and "..") so the layout is faithfully reproduced; this is the dimension
+// where directory packing differences become visible across two images that
+// otherwise hold the same logical content.
+func dumpDirents(img *image, w io.Writer, ino *inode) error {
+	if ino.size == 0 {
+		return nil
+	}
+	blkSize := int64(1) << img.sb.BlkSizeBits
+	nblocks := int((ino.size + blkSize - 1) / blkSize)
+	fmt.Fprintln(w, "  dirents:")
+	for bn := 0; bn < nblocks; bn++ {
+		pos := int64(bn) << img.sb.BlkSizeBits
+		b, err := img.loadBlock(ino, pos)
+		if err != nil {
+			return fmt.Errorf("load dirent block %d for nid %d: %w", bn, ino.nid, err)
+		}
+		buf := b.bytes()
+		fmt.Fprintf(w, "    block %d:\n", bn)
+		if len(buf) < disk.SizeDirent {
+			img.putBlock(b)
+			return fmt.Errorf("dirent block %d for nid %d too small (%d bytes)", bn, ino.nid, len(buf))
+		}
+		first, _, err := blockDirent(buf, 0, 1)
+		if err != nil {
+			img.putBlock(b)
+			return fmt.Errorf("decode first dirent in block %d for nid %d: %w", bn, ino.nid, err)
+		}
+		if first.NameOff%disk.SizeDirent != 0 {
+			img.putBlock(b)
+			return fmt.Errorf("dirent block %d for nid %d: name_off %d not aligned to dirent size",
+				bn, ino.nid, first.NameOff)
+		}
+		entryN := first.NameOff / disk.SizeDirent
+		for i := uint16(0); i < entryN; i++ {
+			de, name, err := blockDirent(buf, i, entryN)
+			if err != nil {
+				img.putBlock(b)
+				return fmt.Errorf("decode dirent %d in block %d for nid %d: %w", i, bn, ino.nid, err)
+			}
+			fmt.Fprintf(w, "      [%d] name=%q nid=%d ftype=%d (%s) name_off=%d\n",
+				i, string(name), de.Nid, de.FileType, ftypeName(de.FileType), de.NameOff)
+		}
+		img.putBlock(b)
+	}
+	return nil
+}
+
+func ftypeName(t uint8) string {
+	switch t {
+	case disk.FileTypeReg:
+		return "reg"
+	case disk.FileTypeDir:
+		return "dir"
+	case disk.FileTypeChrdev:
+		return "chrdev"
+	case disk.FileTypeBlkdev:
+		return "blkdev"
+	case disk.FileTypeFifo:
+		return "fifo"
+	case disk.FileTypeSock:
+		return "sock"
+	case disk.FileTypeSymlink:
+		return "symlink"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
+	}
 }
 
 func layoutName(l uint8) string {
