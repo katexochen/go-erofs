@@ -1,0 +1,69 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io/fs"
+	"os"
+
+	"github.com/erofs/go-erofs"
+)
+
+func runLs(args []string) error {
+	fs := flag.NewFlagSet("ls", flag.ExitOnError)
+	var path string
+	fs.StringVar(&path, "img", "", "Path to erofs image")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if path == "" {
+		return fmt.Errorf("ls: -img is required")
+	}
+	return lsImage(path)
+}
+
+func lsImage(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	img, err := erofs.Open(f)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Found valid image...\n")
+
+	return fs.WalkDir(img, "/", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("error visiting %s: %w", path, err)
+		}
+		fmt.Printf("visited: %q\n", path)
+		fmt.Printf("\tName: %q\n", entry.Name())
+		fmt.Printf("\tType: %o\n", entry.Type())
+		if entry.IsDir() {
+			fmt.Printf("\tIs a directory: yes\n")
+		} else {
+			fmt.Printf("\tIs a directory: no\n")
+		}
+		fi, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("error getting info for %s: %w", path, err)
+		}
+		fmt.Printf("\tMode: %o\n", fi.Mode())
+		fmt.Printf("\tModTime: %s\n", fi.ModTime())
+		st := fi.Sys().(*erofs.Stat)
+		if len(st.Xattrs) > 0 {
+			fmt.Printf("\tXattrs:\n")
+			for k, v := range st.Xattrs {
+				fmt.Printf("\t\t%s: %q\n", k, v)
+			}
+		}
+		if entry.Name() == "." || entry.Name() == ".." {
+			return fs.SkipDir
+		}
+		return nil
+	})
+}
