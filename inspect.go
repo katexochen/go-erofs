@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"strings"
 
 	"github.com/erofs/go-erofs/internal/disk"
@@ -37,6 +38,9 @@ func Dump(r io.ReaderAt, w io.Writer, opts ...OpenOpt) error {
 		return err
 	}
 	if err := dumpLongXattrPrefixes(img, w); err != nil {
+		return err
+	}
+	if err := dumpInodes(img, w); err != nil {
 		return err
 	}
 	return nil
@@ -210,4 +214,114 @@ func trimNul(b []byte) string {
 		b = b[:i]
 	}
 	return string(b)
+}
+
+// dumpInodes walks the image via fs.WalkDir and emits one [inode] section per
+// path in DFS lexical order. Each section prints the parsed inode core plus a
+// layout-specific interpretation of the inode_data field.
+func dumpInodes(img *image, w io.Writer) error {
+	return fs.WalkDir(img, ".", func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		ino, err := img.inodeForPath(p)
+		if err != nil {
+			return fmt.Errorf("read inode for %q: %w", p, err)
+		}
+		defer img.releaseInodeCache(ino)
+		fmt.Fprintln(w)
+		if err := dumpInodeCore(img, w, dumpPath(p), ino); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// inodeForPath resolves a fs.WalkDir-style path to an *inode, without
+// following the final component (so symlinks are dumped as themselves).
+func (img *image) inodeForPath(p string) (*inode, error) {
+	nid, ftype, basename, err := img.resolve("dump", p, false)
+	if err != nil {
+		return nil, err
+	}
+	f := &file{img: img, name: basename, nid: nid, ftype: ftype}
+	return f.readInfo()
+}
+
+// releaseInodeCache returns any block held by ino.cached to the pool. Callers
+// must invoke this after consuming an inode read for dumping.
+func (img *image) releaseInodeCache(ino *inode) {
+	if ino != nil && ino.cached != nil {
+		img.putBlock(ino.cached)
+		ino.cached = nil
+	}
+}
+
+// dumpPath rewrites fs.WalkDir's relative paths to absolute display form,
+// preserving "/" for the root.
+func dumpPath(p string) string {
+	if p == "" || p == "." {
+		return "/"
+	}
+	return "/" + p
+}
+
+func dumpInodeCore(img *image, w io.Writer, displayPath string, ino *inode) error {
+	mode := disk.EroFSModeToGoFileMode(ino.rawMode)
+	fmt.Fprintf(w, "[inode] path=%s nid=%d layout=%s(%d) compact=%t\n",
+		displayPath, ino.nid, layoutName(ino.inodeLayout), ino.inodeLayout,
+		ino.icsize == disk.SizeInodeCompact)
+	fmt.Fprintf(w, "  raw_mode=0o%o mode=%s\n", ino.rawMode, mode)
+	fmt.Fprintf(w, "  uid=%d gid=%d size=%d nlink=%d\n", ino.uid, ino.gid, ino.size, ino.nlink)
+	fmt.Fprintf(w, "  mtime=%d mtime_ns=%d\n", ino.mtime, ino.mtimeNs)
+	fmt.Fprintf(w, "  icsize=%d xsize=%d\n", ino.icsize, ino.xsize)
+	fmt.Fprintf(w, "  inode_data=0x%08x%s\n", ino.inodeData, inodeDataHint(ino))
+	return nil
+}
+
+// inodeDataHint returns a parenthesised, layout-specific decoding of the
+// inode_data field, or "" if no interpretation applies. The hint helps a
+// reader interpret the raw word quickly when diffing.
+func inodeDataHint(ino *inode) string {
+	switch ino.rawMode & disk.StatTypeMask {
+	case disk.StatTypeChrdev, disk.StatTypeBlkdev, disk.StatTypeFifo, disk.StatTypeSock:
+		return fmt.Sprintf(" (rdev=0x%x)", ino.inodeData)
+	}
+	switch ino.inodeLayout {
+	case disk.LayoutFlatPlain, disk.LayoutFlatInline:
+		return fmt.Sprintf(" (data_blkaddr=%d)", ino.inodeData)
+	case disk.LayoutChunkBased:
+		fmtBits := uint16(ino.inodeData) & disk.LayoutChunkFormatBits
+		flags := uint16(ino.inodeData) &^ uint16(disk.LayoutChunkFormatBits)
+		var bits []string
+		if flags&disk.LayoutChunkFormatIndexes != 0 {
+			bits = append(bits, "INDEXES")
+		}
+		if flags&disk.LayoutChunkFormat48Bit != 0 {
+			bits = append(bits, "48BIT")
+		}
+		flagStr := ""
+		if len(bits) > 0 {
+			flagStr = " [" + strings.Join(bits, "|") + "]"
+		}
+		return fmt.Sprintf(" (chunk_format_bits=%d%s)", fmtBits, flagStr)
+	}
+	return ""
+}
+
+func layoutName(l uint8) string {
+	switch l {
+	case disk.LayoutFlatPlain:
+		return "flat-plain"
+	case disk.LayoutCompressedFull:
+		return "compressed-full"
+	case disk.LayoutFlatInline:
+		return "flat-inline"
+	case disk.LayoutCompressedCompact:
+		return "compressed-compact"
+	case disk.LayoutChunkBased:
+		return "chunk-based"
+	default:
+		return fmt.Sprintf("unknown(%d)", l)
+	}
 }
