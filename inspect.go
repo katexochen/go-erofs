@@ -245,6 +245,11 @@ func dumpInodes(img *image, w io.Writer) error {
 				return err
 			}
 		}
+		if ino.inodeLayout == disk.LayoutChunkBased {
+			if err := dumpChunks(img, w, ino); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -366,6 +371,67 @@ func dumpDirents(img *image, w io.Writer, ino *inode) error {
 				i, string(name), de.Nid, de.FileType, ftypeName(de.FileType), de.NameOff)
 		}
 		img.putBlock(b)
+	}
+	return nil
+}
+
+// dumpChunks emits the chunk index for a chunk-based inode: format flags
+// breakdown, derived chunk size, and per-chunk (device_id, physical block)
+// or hole markers. The on-disk encoding is either 4-byte (legacy) or 8-byte
+// (with index flag) per chunk; both are decoded.
+func dumpChunks(img *image, w io.Writer, ino *inode) error {
+	if ino.size == 0 {
+		return nil
+	}
+	format := uint16(ino.inodeData)
+	chunkBits := img.sb.BlkSizeBits + uint8(format&disk.LayoutChunkFormatBits)
+	chunkSize := uint64(1) << chunkBits
+	nchunks := int((ino.size-1)>>chunkBits) + 1
+
+	unit := int64(4)
+	if format&disk.LayoutChunkFormatIndexes != 0 {
+		unit = 8
+	}
+	if format&disk.LayoutChunkFormat48Bit != 0 {
+		// loadBlock returns ErrNotImplemented for 48-bit chunks; we surface
+		// the metadata anyway since the dump is informational.
+	}
+
+	inodeStart := img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
+	baseOffset := inodeStart + ino.flatDataOffset()
+	if unit == 8 && baseOffset%8 != 0 {
+		baseOffset = (baseOffset + 7) & ^int64(7)
+	}
+
+	fmt.Fprintf(w, "  chunks: chunk_bits=%d (chunk_size=%d) count=%d unit=%d\n",
+		chunkBits, chunkSize, nchunks, unit)
+
+	buf := make([]byte, nchunks*int(unit))
+	if _, err := img.meta.ReadAt(buf, baseOffset); err != nil {
+		return fmt.Errorf("read chunk index for nid %d: %w", ino.nid, err)
+	}
+	for i := 0; i < nchunks; i++ {
+		off := i * int(unit)
+		if unit == 8 {
+			blkHi := binary.LittleEndian.Uint16(buf[off : off+2])
+			devRaw := binary.LittleEndian.Uint16(buf[off+2 : off+4])
+			blkLo := binary.LittleEndian.Uint32(buf[off+4 : off+8])
+			if ^blkLo == 0 {
+				fmt.Fprintf(w, "    [%d] hole (dev_raw=0x%04x blk_hi=0x%04x)\n", i, devRaw, blkHi)
+				continue
+			}
+			devID := devRaw & img.deviceIDMask
+			phys := (uint64(blkHi) << 32) | uint64(blkLo)
+			fmt.Fprintf(w, "    [%d] dev_id=%d (raw=0x%04x) blk_addr=0x%x\n",
+				i, devID, devRaw, phys)
+		} else {
+			raw := binary.LittleEndian.Uint32(buf[off : off+4])
+			if ^raw == 0 {
+				fmt.Fprintf(w, "    [%d] hole\n", i)
+				continue
+			}
+			fmt.Fprintf(w, "    [%d] blk_addr=0x%x\n", i, raw)
+		}
 	}
 	return nil
 }
