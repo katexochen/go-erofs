@@ -256,6 +256,12 @@ type image struct {
 	// lz4Cfg holds parsed COMPR_CFGS / defaults for LZ4 decompression.
 	lz4Cfg disk.LZ4Cfgs
 
+	// zstdCfg holds the parsed Zstd COMPR_CFGS record; only valid if
+	// zstdCfgPresent is true. Not consulted at decode time, but retained so
+	// Dump can surface it.
+	zstdCfg        disk.ZstdCfgs
+	zstdCfgPresent bool
+
 	// pcCache caches recently decompressed pclusters across compressed reads.
 	pcCacheOnce sync.Once
 	pcCache     *pclusterCache
@@ -307,16 +313,17 @@ func (img *image) parseComprCfgs() error {
 		case disk.ComprAlgZstd:
 			// We don't actually need ZstdCfgs at decode time
 			// (klauspost/compress/zstd handles arbitrary windows up to its
-			// own configured maximum), but parse the record so the COMPR_CFGS
-			// stream advances correctly for any subsequent algorithm entries.
+			// own configured maximum), but parse and retain the record so
+			// the COMPR_CFGS stream advances correctly for any subsequent
+			// algorithm entries and Dump can surface it.
 			if size < disk.SizeZstdCfgs {
 				return fmt.Errorf("zstd compr_cfgs payload too short: %d < %d: %w",
 					size, disk.SizeZstdCfgs, ErrInvalidSuperblock)
 			}
-			var zcfg disk.ZstdCfgs
-			if _, err := binary.Decode(payload[:disk.SizeZstdCfgs], binary.LittleEndian, &zcfg); err != nil {
+			if _, err := binary.Decode(payload[:disk.SizeZstdCfgs], binary.LittleEndian, &img.zstdCfg); err != nil {
 				return fmt.Errorf("decode zstd compr_cfgs: %w", err)
 			}
+			img.zstdCfgPresent = true
 		}
 	}
 	return nil

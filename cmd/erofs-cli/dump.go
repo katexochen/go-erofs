@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"os"
+
+	"github.com/erofs/go-erofs"
 )
 
 func runDump(args []string) error {
@@ -15,5 +19,13 @@ func runDump(args []string) error {
 	if path == "" {
 		return fmt.Errorf("dump: -img is required")
 	}
-	return fmt.Errorf("dump: not yet implemented")
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	w := bufio.NewWriter(os.Stdout)
+	defer func() { _ = w.Flush() }()
+	return erofs.Dump(f, w)
 }
