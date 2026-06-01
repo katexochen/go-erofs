@@ -439,8 +439,10 @@ func dumpZMapHeader(img *image, w io.Writer, h disk.ZMapHeader, addr int64) {
 		if !fragmentInode {
 			role = "pcluster tail in packed inode"
 		}
-		fmt.Fprintf(w, "    h_fragmentoff: 0x%08x (%d) [%s, packed_nid=%d]\n",
-			fragOff, fragOff, role, img.sb.PackedNid)
+		// packed_nid is shown once in the [superblock] section; do not echo
+		// it here, otherwise a single packed-inode shift produces N noisy
+		// hunks in the diff (one per fragment inode).
+		fmt.Fprintf(w, "    h_fragmentoff: 0x%08x (%d) [%s]\n", fragOff, fragOff, role)
 	case h.Advise&disk.ZAdviseInlinePcluster != 0:
 		fmt.Fprintf(w, "    h_reserved1: 0x%04x\n", h.Reserved1)
 		fmt.Fprintf(w, "    h_idata_size: %d [tailpacking]\n", h.IdataSize)
