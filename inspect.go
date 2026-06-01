@@ -2,9 +2,11 @@ package erofs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/fs"
+	"sort"
 	"strings"
 
 	"github.com/erofs/go-erofs/internal/disk"
@@ -238,6 +240,11 @@ func dumpInodes(img *image, w io.Writer) error {
 				return err
 			}
 		}
+		if ino.xsize > 0 {
+			if err := dumpXattrs(img, w, ino); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -361,6 +368,148 @@ func dumpDirents(img *image, w io.Writer, ino *inode) error {
 		img.putBlock(b)
 	}
 	return nil
+}
+
+// dumpXattrs emits the on-disk xattr layout for an inode: body header, shared
+// xattr references (with the resolved entry from the shared xattr block), and
+// inline entries with their raw NameIndex byte decoded. Followed by a sorted
+// resolved name->value listing so the on-disk view and the logical view can
+// both be diffed.
+func dumpXattrs(img *image, w io.Writer, ino *inode) error {
+	addr := img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact + int64(ino.icsize)
+	buf := make([]byte, ino.xsize)
+	if _, err := img.meta.ReadAt(buf, addr); err != nil {
+		return fmt.Errorf("read xattr area for nid %d: %w", ino.nid, err)
+	}
+	if len(buf) < disk.SizeXattrBodyHeader {
+		return fmt.Errorf("xattr area too small for nid %d (%d bytes)", ino.nid, len(buf))
+	}
+
+	var xh disk.XattrHeader
+	if _, err := binary.Decode(buf[:disk.SizeXattrBodyHeader], binary.LittleEndian, &xh); err != nil {
+		return fmt.Errorf("decode xattr body header for nid %d: %w", ino.nid, err)
+	}
+	fmt.Fprintln(w, "  xattrs:")
+	fmt.Fprintf(w, "    body_header: name_filter=0x%08x shared_count=%d\n",
+		xh.NameFilter, xh.SharedCount)
+
+	pos := disk.SizeXattrBodyHeader
+	resolved := make(map[string]string)
+
+	if xh.SharedCount > 0 {
+		fmt.Fprintln(w, "    shared_refs:")
+		for i := uint8(0); i < xh.SharedCount; i++ {
+			if pos+4 > len(buf) {
+				return fmt.Errorf("xattr shared ref %d for nid %d out of range", i, ino.nid)
+			}
+			ref := binary.LittleEndian.Uint32(buf[pos : pos+4])
+			name, value, hint, err := readSharedXattr(img, ref)
+			if err != nil {
+				return fmt.Errorf("read shared xattr %d (addr=0x%08x) for nid %d: %w", i, ref, ino.nid, err)
+			}
+			fmt.Fprintf(w, "      [%d] addr=0x%08x %s name=%q value=%q\n", i, ref, hint, name, value)
+			resolved[name] = value
+			pos += 4
+		}
+	}
+
+	if pos < len(buf) {
+		fmt.Fprintln(w, "    inline_entries:")
+		idx := 0
+		for pos < len(buf) {
+			if pos+disk.SizeXattrEntry > len(buf) {
+				return fmt.Errorf("xattr inline entry %d for nid %d truncated", idx, ino.nid)
+			}
+			var e disk.XattrEntry
+			if _, err := binary.Decode(buf[pos:pos+disk.SizeXattrEntry], binary.LittleEndian, &e); err != nil {
+				return fmt.Errorf("decode xattr entry %d for nid %d: %w", idx, ino.nid, err)
+			}
+			nameStart := pos + disk.SizeXattrEntry
+			valueStart := nameStart + int(e.NameLen)
+			valueEnd := valueStart + int(e.ValueLen)
+			if valueEnd > len(buf) {
+				return fmt.Errorf("xattr inline entry %d for nid %d body out of range", idx, ino.nid)
+			}
+			rawName := string(buf[nameStart:valueStart])
+			value := string(buf[valueStart:valueEnd])
+			prefix, hint, err := resolveXattrPrefix(img, e.NameIndex)
+			if err != nil {
+				return fmt.Errorf("xattr entry %d for nid %d: %w", idx, ino.nid, err)
+			}
+			fmt.Fprintf(w,
+				"      [%d] name_index=0x%02x (%s) name_len=%d value_len=%d name=%q value=%q\n",
+				idx, e.NameIndex, hint, e.NameLen, e.ValueLen, rawName, value)
+			resolved[prefix+rawName] = value
+
+			consumed := disk.SizeXattrEntry + int(e.NameLen) + int(e.ValueLen)
+			if rem := consumed % 4; rem != 0 {
+				consumed += 4 - rem
+			}
+			pos += consumed
+			idx++
+		}
+	}
+
+	if len(resolved) > 0 {
+		fmt.Fprintln(w, "    resolved:")
+		keys := make([]string, 0, len(resolved))
+		for k := range resolved {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(w, "      %q: %q\n", k, resolved[k])
+		}
+	}
+	return nil
+}
+
+// readSharedXattr reads a single xattr entry from the shared xattr block at
+// the 4-byte unit offset addr (i.e. byte offset = xattr_blk_addr * blockSize +
+// addr * 4). Returns the resolved full name, value, and a human-readable hint
+// describing the on-disk NameIndex encoding.
+func readSharedXattr(img *image, addr uint32) (name, value, hint string, err error) {
+	off := int64(img.sb.XattrBlkAddr)<<img.sb.BlkSizeBits + int64(addr)*4
+	var head [disk.SizeXattrEntry]byte
+	if _, err := img.meta.ReadAt(head[:], off); err != nil {
+		return "", "", "", fmt.Errorf("read shared xattr header: %w", err)
+	}
+	var e disk.XattrEntry
+	if _, err := binary.Decode(head[:], binary.LittleEndian, &e); err != nil {
+		return "", "", "", fmt.Errorf("decode shared xattr header: %w", err)
+	}
+	body := make([]byte, int(e.NameLen)+int(e.ValueLen))
+	if _, err := img.meta.ReadAt(body, off+disk.SizeXattrEntry); err != nil {
+		return "", "", "", fmt.Errorf("read shared xattr body: %w", err)
+	}
+	prefix, hintBase, err := resolveXattrPrefix(img, e.NameIndex)
+	if err != nil {
+		return "", "", "", err
+	}
+	rawName := string(body[:e.NameLen])
+	return prefix + rawName,
+		string(body[e.NameLen:]),
+		fmt.Sprintf("name_index=0x%02x (%s) name_len=%d value_len=%d",
+			e.NameIndex, hintBase, e.NameLen, e.ValueLen),
+		nil
+}
+
+// resolveXattrPrefix returns the full prefix string for an on-disk NameIndex
+// byte, plus a short hint describing whether it is a short or long prefix.
+func resolveXattrPrefix(img *image, nameIndex uint8) (prefix, hint string, err error) {
+	if nameIndex&0x80 != 0 {
+		idx := nameIndex &^ 0x80
+		p, lerr := img.getLongPrefix(idx)
+		if lerr != nil {
+			return "", "", fmt.Errorf("long prefix idx=%d: %w", idx, lerr)
+		}
+		return p, fmt.Sprintf("long, prefix_idx=%d, prefix=%q", idx, p), nil
+	}
+	if nameIndex == 0 {
+		return "", "no prefix", nil
+	}
+	p := xattrIndex(nameIndex).String()
+	return p, fmt.Sprintf("short, prefix=%q", p), nil
 }
 
 func ftypeName(t uint8) string {
