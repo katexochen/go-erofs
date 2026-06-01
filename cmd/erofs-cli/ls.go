@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 
@@ -61,9 +63,42 @@ func lsImage(path string) error {
 				fmt.Printf("\t\t%s: %q\n", k, v)
 			}
 		}
+		// Hash the content of regular files and symlinks. For symlinks the
+		// "content" is the target string. Directories, devices, fifos, and
+		// sockets have no content layer to hash.
+		switch {
+		case entry.Type()&fs.ModeType == 0:
+			sum, err := hashFile(img, path)
+			if err != nil {
+				fmt.Printf("\tSHA256: <error: %v>\n", err)
+			} else {
+				fmt.Printf("\tSHA256: %x\n", sum)
+			}
+		case entry.Type()&fs.ModeSymlink != 0:
+			target, err := fs.ReadLink(img, path)
+			if err != nil {
+				fmt.Printf("\tSHA256: <error: %v>\n", err)
+			} else {
+				sum := sha256.Sum256([]byte(target))
+				fmt.Printf("\tSHA256: %x  (symlink target)\n", sum[:])
+			}
+		}
 		if entry.Name() == "." || entry.Name() == ".." {
 			return fs.SkipDir
 		}
 		return nil
 	})
+}
+
+func hashFile(fsys fs.FS, path string) ([]byte, error) {
+	f, err := fsys.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
