@@ -79,6 +79,17 @@ const (
 	ZAdviseInlinePcluster     = 1 << 3
 	ZAdviseInterlacedPcluster = 1 << 4
 	ZAdviseFragmentPcluster   = 1 << 5
+
+	// ZClusterBitsLclusterMask is the mask for the lcluster-bits offset
+	// (low 3 bits of z_erofs_map_header.h_clusterbits): lcluster_size =
+	// 1 << (BlkSizeBits + (h_clusterbits & mask)).
+	ZClusterBitsLclusterMask = 0x07
+	// ZClusterBitsFragmentInode is bit 7 of z_erofs_map_header.h_clusterbits.
+	// When set, this inode has no lcluster index of its own: its data is
+	// packed into the packed inode (SuperBlock.PackedNid) at byte offset
+	// h_fragmentoff (the union'd interpretation of h_reserved1 +
+	// h_idata_size).
+	ZClusterBitsFragmentInode = 1 << 7
 )
 
 // SuperBlock represents the EROFS on-disk superblock.

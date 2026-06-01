@@ -420,19 +420,50 @@ func dumpCompressed(img *image, w io.Writer, ino *inode) error {
 }
 
 func dumpZMapHeader(img *image, w io.Writer, h disk.ZMapHeader, addr int64) {
-	lclusterBits := img.sb.BlkSizeBits + (h.ClusterBits & 7)
+	lclusterBits := img.sb.BlkSizeBits + (h.ClusterBits & disk.ZClusterBitsLclusterMask)
 	fmt.Fprintln(w, "  zmap_header:")
 	fmt.Fprintf(w, "    addr: 0x%x\n", addr)
-	fmt.Fprintf(w, "    reserved1: 0x%04x\n", h.Reserved1)
-	fmt.Fprintf(w, "    idata_size: %d\n", h.IdataSize)
+
+	// The first 4 bytes are a union. Show h_fragmentoff when the inode is
+	// a fragment inode (whole file in packed inode) or has a FRAGMENT_PCLUSTER
+	// tail (last pcluster in packed inode); show h_reserved1 + h_idata_size
+	// when the file uses INLINE_PCLUSTER tailpacking; otherwise both halves
+	// should be zero and either interpretation is shown literally.
+	fragmentInode := h.ClusterBits&disk.ZClusterBitsFragmentInode != 0
+	switch {
+	case fragmentInode || h.Advise&disk.ZAdviseFragmentPcluster != 0:
+		fragOff := uint32(h.Reserved1) | uint32(h.IdataSize)<<16
+		role := "whole file in packed inode"
+		if !fragmentInode {
+			role = "pcluster tail in packed inode"
+		}
+		fmt.Fprintf(w, "    h_fragmentoff: 0x%08x (%d) [%s, packed_nid=%d]\n",
+			fragOff, fragOff, role, img.sb.PackedNid)
+	case h.Advise&disk.ZAdviseInlinePcluster != 0:
+		fmt.Fprintf(w, "    h_reserved1: 0x%04x\n", h.Reserved1)
+		fmt.Fprintf(w, "    h_idata_size: %d [tailpacking]\n", h.IdataSize)
+	default:
+		fmt.Fprintf(w, "    h_reserved1: 0x%04x\n", h.Reserved1)
+		fmt.Fprintf(w, "    h_idata_size: %d\n", h.IdataSize)
+	}
+
 	fmt.Fprintf(w, "    advise: 0x%04x [%s]\n", h.Advise, formatZAdvise(h.Advise))
 	fmt.Fprintf(w, "    algorithm_type: head1=%s(%d) head2=%s(%d) (raw=0x%02x)\n",
 		algoName(h.AlgorithmType&0xF), h.AlgorithmType&0xF,
 		algoName(h.AlgorithmType>>4), h.AlgorithmType>>4,
 		h.AlgorithmType)
-	fmt.Fprintf(w, "    cluster_bits_raw: 0x%02x\n", h.ClusterBits)
+	fmt.Fprintf(w, "    cluster_bits_raw: 0x%02x [%s]\n",
+		h.ClusterBits, formatZClusterBits(h.ClusterBits))
 	fmt.Fprintf(w, "    lcluster_bits: %d (lcluster_size=%d)\n",
 		lclusterBits, 1<<lclusterBits)
+}
+
+func formatZClusterBits(cb uint8) string {
+	var parts []string
+	if cb&disk.ZClusterBitsFragmentInode != 0 {
+		parts = append(parts, "FRAGMENT_INODE")
+	}
+	return strings.Join(parts, "|")
 }
 
 func dumpLclusters(w io.Writer, dec *zerofs.Decoder) error {
