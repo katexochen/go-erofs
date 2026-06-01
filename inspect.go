@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/erofs/go-erofs/internal/disk"
+	"github.com/erofs/go-erofs/internal/zerofs"
 )
 
 // Dump writes a textual, diff-friendly description of every on-disk structure
@@ -250,6 +251,12 @@ func dumpInodes(img *image, w io.Writer) error {
 				return err
 			}
 		}
+		if ino.inodeLayout == disk.LayoutCompressedFull ||
+			ino.inodeLayout == disk.LayoutCompressedCompact {
+			if err := dumpCompressed(img, w, ino); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -373,6 +380,169 @@ func dumpDirents(img *image, w io.Writer, ino *inode) error {
 		img.putBlock(b)
 	}
 	return nil
+}
+
+// dumpCompressed emits the compressed-layout map for an inode: the raw
+// z_erofs_map_header with decoded advise bits and head1/head2 algorithm
+// names, every lcluster index entry, and the resolved pcluster boundaries.
+//
+// The header is always dumped (so unsupported features are still surfaced);
+// the lcluster index and pcluster walk are only attempted if the decoder can
+// be built — when parsing fails the error is reported in-line and we move on.
+func dumpCompressed(img *image, w io.Writer, ino *inode) error {
+	inodeAddr := img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
+	mapHeaderAddr := alignUp8(inodeAddr + int64(ino.icsize) + int64(ino.xsize))
+
+	var hbuf [disk.SizeZMapHeader]byte
+	if _, err := img.meta.ReadAt(hbuf[:], mapHeaderAddr); err != nil {
+		return fmt.Errorf("read zmap header for nid %d: %w", ino.nid, err)
+	}
+	var h disk.ZMapHeader
+	if _, err := binary.Decode(hbuf[:], binary.LittleEndian, &h); err != nil {
+		return fmt.Errorf("decode zmap header for nid %d: %w", ino.nid, err)
+	}
+	dumpZMapHeader(img, w, h, mapHeaderAddr)
+
+	dec, err := img.buildZDecoder(ino)
+	if err != nil {
+		fmt.Fprintf(w, "  zmap: build_decoder_error: %v\n", err)
+		return nil
+	}
+	if err := dumpLclusters(w, dec); err != nil {
+		fmt.Fprintf(w, "  zmap: lcluster_error: %v\n", err)
+		return nil
+	}
+	if err := dumpPclusters(w, dec); err != nil {
+		fmt.Fprintf(w, "  zmap: pcluster_error: %v\n", err)
+		return nil
+	}
+	return nil
+}
+
+func dumpZMapHeader(img *image, w io.Writer, h disk.ZMapHeader, addr int64) {
+	lclusterBits := img.sb.BlkSizeBits + (h.ClusterBits & 7)
+	fmt.Fprintln(w, "  zmap_header:")
+	fmt.Fprintf(w, "    addr: 0x%x\n", addr)
+	fmt.Fprintf(w, "    reserved1: 0x%04x\n", h.Reserved1)
+	fmt.Fprintf(w, "    idata_size: %d\n", h.IdataSize)
+	fmt.Fprintf(w, "    advise: 0x%04x [%s]\n", h.Advise, formatZAdvise(h.Advise))
+	fmt.Fprintf(w, "    algorithm_type: head1=%s(%d) head2=%s(%d) (raw=0x%02x)\n",
+		algoName(h.AlgorithmType&0xF), h.AlgorithmType&0xF,
+		algoName(h.AlgorithmType>>4), h.AlgorithmType>>4,
+		h.AlgorithmType)
+	fmt.Fprintf(w, "    cluster_bits_raw: 0x%02x\n", h.ClusterBits)
+	fmt.Fprintf(w, "    lcluster_bits: %d (lcluster_size=%d)\n",
+		lclusterBits, 1<<lclusterBits)
+}
+
+func dumpLclusters(w io.Writer, dec *zerofs.Decoder) error {
+	fmt.Fprintf(w, "  lclusters: count=%d index_base=0x%x\n", dec.NLclusters, dec.IndexBase)
+	for i := 0; i < dec.NLclusters; i++ {
+		e, err := dec.Entry(i)
+		if err != nil {
+			return fmt.Errorf("entry %d: %w", i, err)
+		}
+		switch e.Type {
+		case disk.ZLclusterTypePlain:
+			fmt.Fprintf(w, "    [%d] type=plain cluster_ofs=%d blkaddr=0x%x\n",
+				i, e.ClusterOfs, e.BlkAddr)
+		case disk.ZLclusterTypeHead1:
+			fmt.Fprintf(w, "    [%d] type=head1 cluster_ofs=%d blkaddr=0x%x\n",
+				i, e.ClusterOfs, e.BlkAddr)
+		case disk.ZLclusterTypeHead2:
+			fmt.Fprintf(w, "    [%d] type=head2 cluster_ofs=%d blkaddr=0x%x\n",
+				i, e.ClusterOfs, e.BlkAddr)
+		case disk.ZLclusterTypeNonhead:
+			fmt.Fprintf(w, "    [%d] type=nonhead delta_prev=%d delta_next=%d cblkcnt=%d\n",
+				i, e.DeltaPrev, e.DeltaNext, e.CBlkCnt)
+		default:
+			fmt.Fprintf(w, "    [%d] type=unknown(%d)\n", i, e.Type)
+		}
+	}
+	return nil
+}
+
+func dumpPclusters(w io.Writer, dec *zerofs.Decoder) error {
+	if dec.Size == 0 {
+		return nil
+	}
+	fmt.Fprintln(w, "  pclusters:")
+	lcsize := dec.LclusterSize()
+	seen := make(map[int]bool)
+	idx := 0
+	for pos := int64(0); pos < dec.Size; {
+		pc, err := dec.FindPclusterForOffset(pos)
+		if err != nil {
+			return fmt.Errorf("find pcluster at %d: %w", pos, err)
+		}
+		if !seen[pc.HeadLcn] {
+			seen[pc.HeadLcn] = true
+			fmt.Fprintf(w, "    [%d] head_lcn=%d head_type=%s head_blk=0x%x head_ofs=%d nphys=%d log=[%d,%d)\n",
+				idx, pc.HeadLcn, lclusterTypeName(pc.HeadType),
+				pc.HeadBlk, pc.HeadOfs, pc.NPhysBlks,
+				pc.LogStart, pc.LogStart+pc.LogLen)
+			idx++
+		}
+		// Advance to the next lcluster boundary or end of pcluster, whichever comes first.
+		next := pc.LogStart + pc.LogLen
+		if next <= pos {
+			// Safety: avoid infinite loop on malformed input.
+			next = pos + lcsize
+		}
+		pos = next
+	}
+	return nil
+}
+
+func formatZAdvise(a uint16) string {
+	bits := []struct {
+		mask uint16
+		name string
+	}{
+		{disk.ZAdviseCompacted2B, "COMPACTED_2B"},
+		{disk.ZAdviseBigPcluster1, "BIG_PCLUSTER_1"},
+		{disk.ZAdviseBigPcluster2, "BIG_PCLUSTER_2"},
+		{disk.ZAdviseInlinePcluster, "INLINE_PCLUSTER"},
+		{disk.ZAdviseInterlacedPcluster, "INTERLACED_PCLUSTER"},
+		{disk.ZAdviseFragmentPcluster, "FRAGMENT_PCLUSTER"},
+	}
+	var parts []string
+	for _, b := range bits {
+		if a&b.mask != 0 {
+			parts = append(parts, b.name)
+		}
+	}
+	return strings.Join(parts, "|")
+}
+
+func algoName(id uint8) string {
+	switch id {
+	case disk.AlgoIDLZ4:
+		return "lz4"
+	case disk.AlgoIDLZMA:
+		return "lzma"
+	case disk.AlgoIDDeflate:
+		return "deflate"
+	case disk.AlgoIDZstd:
+		return "zstd"
+	default:
+		return fmt.Sprintf("unknown(%d)", id)
+	}
+}
+
+func lclusterTypeName(t uint8) string {
+	switch t {
+	case disk.ZLclusterTypePlain:
+		return "plain"
+	case disk.ZLclusterTypeHead1:
+		return "head1"
+	case disk.ZLclusterTypeHead2:
+		return "head2"
+	case disk.ZLclusterTypeNonhead:
+		return "nonhead"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
+	}
 }
 
 // dumpChunks emits the chunk index for a chunk-based inode: format flags
