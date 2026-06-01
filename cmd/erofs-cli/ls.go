@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sort"
 
 	"github.com/erofs/go-erofs"
 )
@@ -59,8 +60,13 @@ func lsImage(path string) error {
 		st := fi.Sys().(*erofs.Stat)
 		if len(st.Xattrs) > 0 {
 			fmt.Printf("\tXattrs:\n")
-			for k, v := range st.Xattrs {
-				fmt.Printf("\t\t%s: %q\n", k, v)
+			keys := make([]string, 0, len(st.Xattrs))
+			for k := range st.Xattrs {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				fmt.Printf("\t\t%s: %q\n", k, st.Xattrs[k])
 			}
 		}
 		// Hash the content of regular files and symlinks. For symlinks the
